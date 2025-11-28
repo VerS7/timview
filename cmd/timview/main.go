@@ -446,14 +446,13 @@ func main() {
 	// Get terminal width for image scaling
 	targetWidth, _, err := platform.GetSize(outFd)
 	if err != nil {
-		Log(WARN, "could not get terminal bounds")
-		if specifiedWidth != 0 {
-			Log(WARN, fmt.Sprintf("width specificly set to %d symbols", specifiedWidth))
-			targetWidth = specifiedWidth
-		} else {
-			Log(WARN, "width implicitly set to 100 symbols")
-			targetWidth = 100
-		}
+		Log(WARN, "could not get terminal bounds. Width implicitly set to 100 symbols")
+		targetWidth = 100
+	}
+
+	if specifiedWidth > 0 {
+		Log(WARN, fmt.Sprintf("width specificly set to %d symbols", specifiedWidth))
+		targetWidth = specifiedWidth
 	}
 
 	imagepath := flag.Arg(0)
