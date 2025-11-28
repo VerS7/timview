@@ -57,8 +57,66 @@ const (
 var (
 	ratio   = flag.Float64("r", 0.5, "aspect ratio of output image. Default is half of terminal width. Min = 0.1, Max = 1")
 	samples = flag.Int("s", 2, "samples count for smoothing output image. Min = 2, Max = 16")
+	width   = flag.Int("w", 0, "width of image in terminal symbols. Default is auto-detected, you rarely should specify it")
 	nowarn  = flag.Bool("nowarn", false, "disables WARN messages")
+	extra   = flag.Bool("extra", false, "extra image info")
+	freeze  = flag.Bool("freeze", false, "freeze and wait for key after displaying image")
 )
+
+type Level int
+
+const (
+	DEBUG Level = iota
+	INFO
+	WARN
+	ERROR
+)
+
+var LevelNames = map[Level]string{DEBUG: "DEBUG", INFO: "INFO", WARN: "WARN", ERROR: "ERROR"}
+
+type SymbolicImage struct {
+	Path          string
+	Repr          string
+	Size          int64
+	InitialBounds image.Rectangle
+	FinalBounds   image.Rectangle
+}
+
+func (si *SymbolicImage) FormatExtra() string {
+	return fmt.Sprintf(
+		"Initial bounds: %dx%d"+NEWLINE+RETURN+"Final bounds: %dx%d"+NEWLINE+RETURN+"Size: %d bytes"+NEWLINE+RETURN,
+		si.InitialBounds.Size().X,
+		si.InitialBounds.Size().Y,
+		si.FinalBounds.Size().X,
+		si.FinalBounds.Size().Y,
+		si.Size)
+}
+
+// Auto panics on ERROR level!
+func Log(level Level, data ...any) {
+	// Skip WARN level if --nowarn
+	if *nowarn && level == WARN {
+		return
+	}
+
+	message := fmt.Sprintf("[%s] ", LevelNames[level])
+	for _, d := range data {
+		message += fmt.Sprintf("%+v", d)
+	}
+	message += NEWLINE + RETURN
+
+	switch level {
+	case WARN:
+		if *nowarn {
+			return
+		}
+		fmt.Print(message)
+	case INFO, DEBUG:
+		fmt.Print(message)
+	case ERROR:
+		panic(message)
+	}
+}
 
 func RenderImage(img image.Image) string {
 	max := img.Bounds().Max
@@ -109,20 +167,29 @@ func RenderImage(img image.Image) string {
 	return finalImg.String()
 }
 
-func ProcessImage(imagepath string, targetWidth int, scale float64) (image.Image, error) {
+func DecodeImage(imagepath string) (image.Image, int64, error) {
 	// Open image file
 	file, err := os.Open(imagepath)
 	if err != nil {
-		return nil, fmt.Errorf("could not open file %s", imagepath)
+		return nil, 0, fmt.Errorf("could not open file %s", imagepath)
 	}
 	defer file.Close()
 
 	// Decode image
 	img, format, err := image.Decode(file)
 	if err != nil {
-		return nil, fmt.Errorf("could not decode image with format %s", format)
+		return nil, 0, fmt.Errorf("could not decode image with format %s", format)
 	}
 
+	stat, err := file.Stat()
+	if err != nil {
+		return nil, 0, fmt.Errorf("could not get file stat of file %s", imagepath)
+	}
+
+	return img, stat.Size(), nil
+}
+
+func ScaleImage(img image.Image, targetWidth int, scale float64) (image.Image, error) {
 	scale = util.Clamp(scale, 0.1, 1.0)
 
 	newWidth := math.Round(float64(targetWidth) * scale)
@@ -153,7 +220,7 @@ func HandleInput(input chan KEY, in *os.File) {
 		// Read input
 		n, err := in.Read(buf)
 		if err != nil {
-			panic(fmt.Errorf("ERROR: %s", err))
+			Log(ERROR, err)
 		}
 
 		if n > 0 {
@@ -193,12 +260,27 @@ func HandleInput(input chan KEY, in *os.File) {
 	}
 }
 
+func WaitAnyKey(in *os.File, out *os.File) {
+	inFd := int(in.Fd())
+
+	state, _ := platform.MakeRaw(inFd)
+	defer platform.Restore(inFd, state)
+
+	fmt.Fprint(out, "Press any key to exit..."+NEWLINE+RETURN)
+
+	temp := make([]byte, 1)
+	n, _ := in.Read(temp)
+	if n > 0 {
+		return
+	}
+}
+
 func GetImagesFromDir(dir string) []string {
 	images := make([]string, 0)
 
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		panic(fmt.Errorf("ERROR: %s\n\r", err))
+		Log(ERROR, err)
 	}
 
 	for _, entry := range entries {
@@ -218,38 +300,58 @@ func GetImagesFromDir(dir string) []string {
 	return images
 }
 
-func ProcessImages(images chan string, imageFilePaths []string, targetWidth int, scale float64) {
+func ProcessImage(imagepath string, targetWidth int, scale float64) (*SymbolicImage, error) {
+	rawImage, n, err := DecodeImage(imagepath)
+	if err != nil {
+		return nil, err
+	}
+
+	image, err := ScaleImage(rawImage, targetWidth, scale)
+	if err != nil {
+		return nil, err
+	}
+
+	return &SymbolicImage{
+		Path:          imagepath,
+		Repr:          RenderImage(image),
+		Size:          n,
+		InitialBounds: rawImage.Bounds(),
+		FinalBounds:   image.Bounds(),
+	}, nil
+}
+
+func ProcessImages(images chan SymbolicImage, imageFilePaths []string, targetWidth int, scale float64) {
 	for _, imagefp := range imageFilePaths {
-		go func(images chan string) {
+		go func(images chan SymbolicImage) {
 			image, err := ProcessImage(imagefp, targetWidth, scale)
 			if err == nil {
-				images <- RenderImage(image)
+				images <- *image
 			}
 		}(images)
 	}
 }
 
-func InteractiveMode(in *os.File, out *os.File, dir string, targetWidth int, scale float64) {
+func InteractiveMode(in *os.File, out *os.File, dir string, targetWidth int, scale float64, extra bool) {
 	inFd := int(in.Fd())
 
 	// Change terminal mode to raw
 	state, err := platform.MakeRaw(inFd)
 	if err != nil {
-		panic(fmt.Errorf("ERROR: %s\n\r", err))
+		Log(ERROR, err)
 	}
 
 	defer func() {
 		// Change terminal mode back to default
 		err = platform.Restore(inFd, state)
 		if err != nil {
-			panic(fmt.Errorf("ERROR: %s\n\r", err))
+			Log(ERROR, err)
 		}
 	}()
 
 	imageFilePaths := GetImagesFromDir(dir)
 
-	images := make([]string, 0)
-	imagesCh := make(chan string)
+	images := make([]SymbolicImage, 0)
+	imagesCh := make(chan SymbolicImage)
 
 	go ProcessImages(imagesCh, imageFilePaths, targetWidth, scale)
 
@@ -286,18 +388,26 @@ func InteractiveMode(in *os.File, out *os.File, dir string, targetWidth int, sca
 				return
 			}
 
+			img := &images[currElem-1]
 			fmt.Print(out, CLEAR)
-			fmt.Fprintf(out, "Displaying: %s\n\r", imageFilePaths[currElem-1])
-			fmt.Fprint(out, images[currElem-1])
+			fmt.Fprintf(out, "Displaying: %s\n\r", img.Path)
+			if extra {
+				fmt.Fprint(out, img.FormatExtra())
+			}
+			fmt.Fprint(out, img.Repr)
 			PrintControls(out, currElem, maxElems, width)
 
 		case image := <-imagesCh:
 			images = append(images, image)
 			// If first image processed - display it
 			if first {
+				img := &images[currElem-1]
 				fmt.Print(out, CLEAR)
-				fmt.Fprintf(out, "Displaying: %s\n\r", imageFilePaths[currElem-1])
-				fmt.Fprint(out, images[currElem-1])
+				fmt.Fprintf(out, "Displaying: %s\n\r", img.Path)
+				if extra {
+					fmt.Fprint(out, img.FormatExtra())
+				}
+				fmt.Fprint(out, img.Repr)
 				PrintControls(out, currElem, maxElems, width)
 				first = false
 			}
@@ -317,47 +427,73 @@ func main() {
 
 	flag.Parse()
 
-	disableWarnings := *nowarn
+	freezeTerm := *freeze
+	extraImageInfo := *extra
+	imageRatio := *ratio
+	specifiedWidth := *width
 
 	// Enable colored output (platform specific)
 	if colorEnabled := platform.EnableColoredOutput(outFd); !colorEnabled {
-		panic("ERROR: colored output not supported")
+		Log(ERROR, "colored output not supported")
 	}
 
 	// Check if FD is terminal
-	if !platform.IsTerminal(outFd) {
-		if !disableWarnings {
-			fmt.Fprintln(out, "WARN: not in terminal")
-		}
+	isTerminal := platform.IsTerminal(outFd)
+	if !isTerminal {
+		Log(WARN, "not in terminal")
 	}
 
 	// Get terminal width for image scaling
-	width, _, err := platform.GetSize(outFd)
+	targetWidth, _, err := platform.GetSize(outFd)
 	if err != nil {
-		if !disableWarnings {
-			fmt.Fprintln(out, "WARN: could not get terminal bounds. Width set to 100 symbols")
+		Log(WARN, "could not get terminal bounds")
+		if specifiedWidth != 0 {
+			Log(WARN, fmt.Sprintf("width specificly set to %d symbols", specifiedWidth))
+			targetWidth = specifiedWidth
+		} else {
+			Log(WARN, "width implicitly set to 100 symbols")
+			targetWidth = 100
 		}
-		width = 100
 	}
 
 	imagepath := flag.Arg(0)
 	if imagepath == "" {
-		panic("ERROR: image path is empty")
+		Log(ERROR, "image path is empty")
 	}
 
 	stat, err := os.Stat(imagepath)
 	if err != nil {
-		panic(fmt.Errorf("ERROR: %s", err))
+		Log(ERROR, err)
 	}
 
 	if stat.IsDir() {
-		InteractiveMode(in, out, imagepath, width, *ratio)
+		if !isTerminal {
+			Log(ERROR, "interactive mode only supported in terminal")
+			return
+		}
+		InteractiveMode(in, out, imagepath, targetWidth, imageRatio, extraImageInfo)
 	} else {
-		img, err := ProcessImage(imagepath, width, *ratio)
+		img, err := ProcessImage(imagepath, targetWidth, imageRatio)
 		if err != nil {
-			panic(fmt.Errorf("ERROR: %s", err))
+			Log(ERROR, err)
 		}
 
-		fmt.Fprint(out, RenderImage(img))
+		if err != nil {
+			Log(ERROR, err)
+		}
+
+		fmt.Fprint(out, img.Repr)
+
+		if extraImageInfo {
+			fmt.Fprint(out, img.FormatExtra())
+		}
+
+		if freezeTerm {
+			if !isTerminal {
+				Log(ERROR, "freeze only supported in terminal")
+				return
+			}
+			WaitAnyKey(in, out)
+		}
 	}
 }
